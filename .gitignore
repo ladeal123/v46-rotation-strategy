@@ -1,0 +1,18 @@
+# ===== 数据与原始行情(不纳入版本控制, 体积大且可从源重建) =====
+data/
+data_user/data_extract/
+*.log
+
+# ===== 回测输出/成交明细(可重跑生成) =====
+*_trades.csv
+v46_rot_my_trades.csv
+*_results*.json
+backtest_*.json
+v46_*_results.json
+v46_vol_res_*.json
+v46_rot_my_trades.csv
+
+# ===== Python 缓存 =====
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
