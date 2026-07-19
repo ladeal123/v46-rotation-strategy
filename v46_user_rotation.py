@@ -20,6 +20,14 @@ INIT_CASH=10_000_000; POS_SIZE=0.02
 MIN_HOLD=3; STOP_LOSS=-0.15; PROFIT_THRESHOLD=0.50
 COMMISSION_RATE=0.0001; STAMP_TAX_RATE=0.0005
 PENALTY={0:1.0, 1:0.5, 2:0.5, 3:0.5}
+# 中证1000成分股(匹配后933只)
+try:
+    with open('/workspace/zz1000_codes.json') as _f: ZZ1000_CODES=set(json.load(_f))
+except: ZZ1000_CODES=set()
+try:
+    with open('/workspace/zz500_codes.json') as _f: ZZ500_CODES=set(json.load(_f))
+except: ZZ500_CODES=set()
+print(f"  ZZ1000成分股: {len(ZZ1000_CODES)}只  ZZ500成分股: {len(ZZ500_CODES)}只", flush=True)
 
 def get_board(code):
     if code.startswith('30') or code.startswith('688'): return 'chinext'
@@ -119,6 +127,57 @@ if os.environ.get('DEBUG','0')=='1':
         print(f"    v4_state[{dd}]={v4_state.get(dd)}", flush=True)
     print(f"    v4_state[2020-06-02]={v4_state.get('2020-06-02')}", flush=True)
 
+# === v6 状态机: index_timing V4延续 — MA250分环境 + 双V4阈值 + 权重映射 ===
+# 上方: V4_A(th=0.25,bot=-2.0) + 权重(1.0,1.0,0) → bull/flat=50, short=5
+# 下方: V4_B(th=-1.0,bot=-4.0) + 权重(1.0,0.0,0) → bull=50, flat/short=5
+_ma250_v6=[sum(prices[max(0,i-249):i+1])/min(i+1,250) for i in range(n_idx)]
+_v4a=calc_pos10(dif_pct10,slope10,dea10,bar10,0.25,-2.0)
+_v4b=calc_pos10(dif_pct10,slope10,dea10,bar10,-1.0,-4.0)
+_v6_state={}
+for i in range(len(idx_dates)-1):
+    d=idx_dates[i+1]; _v4=_v4a[i] if prices[i]>_ma250_v6[i] else _v4b[i]  # 上方用V4_A, 下方用V4_B
+    if prices[i]>_ma250_v6[i]:
+        # 上方: 权重(1.0,0.4,0) → bull=50, flat=20, short=5
+        _v6_state[d]='bull' if _v4==1 else ('flat' if _v4==0 else 'short')
+    else:
+        # 下方: 权重(1.0,0.0,0) → bull=50, flat/short=5
+        _v6_state[d]='bull' if _v4==1 else 'short'
+print(f"  v6状态: bull={sum(1 for v in _v6_state.values() if v=='bull')} "
+      f"flat={sum(1 for v in _v6_state.values() if v=='flat')} "
+      f"short={sum(1 for v in _v6_state.values() if v=='short')} 天", flush=True)
+
+# === v5 择时信号: MACD(40,80,32) DIF%五区 + MA250_5dOLS分状态 ===
+if len(prices)>250:
+    _ef40=ema(prices,40); _es80=ema(prices,80)
+    _dif_v5=[_ef40[i]-_es80[i] if (_ef40[i] is not None and _es80[i] is not None) else float('nan') for i in range(n_idx)]
+    _difpct_v5=[_dif_v5[i]/prices[i]*100 if (not math.isnan(_dif_v5[i]) and prices[i]>0) else 0.0 for i in range(n_idx)]
+    _slp_v5=dif_slope(_difpct_v5,2)
+    _ma250=[sum(prices[max(0,i-249):i+1])/min(i+1,250) for i in range(n_idx)]
+    _ma5s=dif_slope(_ma250,5)
+    _b1,_b2,_b3,_b4=-3.9,-0.4,0.7,3.9
+    _zones=[(-1e9,_b1),(_b1,_b2),(_b2,_b3),(_b3,_b4),(_b4,1e9)]
+    _BULL_ENTRY=[0.023,0.110,0.069,0.014,0.039]
+    _BULL_EXIT=[-0.026,0.023,0.011,-0.044,-0.096]
+    _BEAR_ENTRY=[0.052,0.072,0.056,0.038,0.029]
+    _BEAR_EXIT=[-0.016,0.031,-0.011,-0.023,-0.053]
+    _v5pos=0; _v5sig={}
+    for i in range(1,n_idx):
+        _rdp=_difpct_v5[i]; _rs=_slp_v5[i]
+        _bull=1 if _ma5s[i]>=0 else 0
+        _entry=_BULL_ENTRY if _bull else _BEAR_ENTRY
+        _exit_=_BULL_EXIT if _bull else _BEAR_EXIT
+        if _v5pos==0:
+            for _k,(_lo,_hi) in enumerate(_zones):
+                if _lo<=_rdp<_hi and _rs>_entry[_k]: _v5pos=1; break
+        else:
+            for _k,(_lo,_hi) in enumerate(_zones):
+                if _lo<=_rdp<_hi and _rs<_exit_[_k]: _v5pos=0; break
+        _v5sig[idx_dates[i]]=1 if _v5pos>0 else 0
+    print(f"  v5信号: 持仓天数={sum(_v5sig.values())}/{n_idx-1} ({sum(_v5sig.values())/(n_idx-1)*100:.0f}%)", flush=True)
+else:
+    _v5sig={}
+    print("  v5信号: 数据不足跳过", flush=True)
+
 print("预计算指标...", flush=True)
 IND={}
 def calc_ema_s(pl,p_):
@@ -148,7 +207,7 @@ for code,dp in stock_data.items():
     IND[code]={'dates':d_list,'prices':pl,'opens':ol,'dif':dif_,'dea':dea_,'bar':bar_,'ma5':ma5_,'ma144':ma144_,'vol10':vol10_,'board':get_board(code),'date_to_idx':{d:i for i,d in enumerate(d_list)}}
 print(f"  IND: {len(IND)}只", flush=True)
 
-# === 行业映射 (SW一级) ===
+# === 行业映射 (SW一级, 31行业) ===
 code2ind={}
 _wb=openpyxl.load_workbook(f'{D}/股票池.xlsx', read_only=True, data_only=True); _ws=_wb['股票池']
 for _row in _ws.iter_rows(min_row=2, values_only=True):
@@ -333,6 +392,10 @@ def industry_signal_at(sig_di, signal):
     if signal=='abn': return {s:ind_z_abn[s][sig_di] for s in industries}
     if signal=='conc': return {s:ind_z_conc[s][sig_di] for s in industries}
     if signal=='abn_conc': return {s:ind_abn_conc[s][sig_di] for s in industries}
+    if signal=='conc10': return {s:ind_z_conc10[s][sig_di] for s in industries}
+    if signal=='conc20': return {s:ind_z_conc20[s][sig_di] for s in industries}
+    if signal=='avgdif_conc10': return {s:ind_avgdif_conc10[s][sig_di] for s in industries}
+    if signal=='avgdif_conc20': return {s:ind_avgdif_conc20[s][sig_di] for s in industries}
     if signal=='volratio': return {s:ind_avg_vr[s][sig_di] for s in industries}
     return {}
 
@@ -361,6 +424,19 @@ for _di in range(n):
     for s in industries:
         v=ind_dif_macd[s][_di]
         ind_z_macd[s].append((v-_m)/_sd if not math.isnan(v) else 0.0)
+# === 行业长周期共振(硬过滤用, V60) — MA30>MA60 / MA45>MA90 ===
+def _reson_ma(arr, n):
+    return [sum(arr[max(0,i-n+1):i+1])/min(i+1,n) for i in range(len(arr))]
+ind_reson60={s:[] for s in industries}
+ind_reson90={s:[] for s in industries}
+for s in industries:
+    _p=ind_price[s]
+    _ma30=_reson_ma(_p,30); _ma60=_reson_ma(_p,60)
+    _ma45=_reson_ma(_p,45); _ma90=_reson_ma(_p,90)
+    for di in range(n):
+        ind_reson60[s].append(1.0 if not math.isnan(_ma30[di]) and not math.isnan(_ma60[di]) and _ma30[di]>_ma60[di] else 0.0)
+        ind_reson90[s].append(1.0 if not math.isnan(_ma45[di]) and not math.isnan(_ma90[di]) and _ma45[di]>_ma90[di] else 0.0)
+RESON_MAP={60:ind_reson60, 90:ind_reson90}
 # 前瞻行业收益(含未来1日, 仅作上界诊断, 非可交易信号)
 ind_fwd_ret={s:[] for s in industries}
 for _di in range(n-1):
@@ -486,6 +562,39 @@ ind_abn_conc={s:[] for s in industries}
 for _di in range(n):
     for s in industries: ind_abn_conc[s].append(ind_z_abn[s][_di]+ind_z_conc[s][_di])
 
+# === V57: conc 滚动版(降噪, 抓"阶段性热度") + 与 avgdif 正交组合 ===
+# 10日滚动HHI均值, z
+ind_conc10={s:[] for s in industries}
+for s in industries:
+    for _di in range(n):
+        _a0=max(0,_di-10+1); _win=ind_conc[s][_a0:_di+1]
+        ind_conc10[s].append(sum(_win)/len(_win))
+ind_z_conc10={s:[] for s in industries}
+for _di in range(n):
+    _vals=[ind_conc10[s][_di] for s in industries]
+    _m=sum(_vals)/len(_vals); _sd=(sum((x-_m)**2 for x in _vals)/len(_vals))**0.5
+    _sd=_sd if _sd>1e-9 else 1.0
+    for s in industries: ind_z_conc10[s].append((ind_conc10[s][_di]-_m)/_sd)
+# 20日滚动HHI均值, z
+ind_conc20={s:[] for s in industries}
+for s in industries:
+    for _di in range(n):
+        _a0=max(0,_di-20+1); _win=ind_conc[s][_a0:_di+1]
+        ind_conc20[s].append(sum(_win)/len(_win))
+ind_z_conc20={s:[] for s in industries}
+for _di in range(n):
+    _vals=[ind_conc20[s][_di] for s in industries]
+    _m=sum(_vals)/len(_vals); _sd=(sum((x-_m)**2 for x in _vals)/len(_vals))**0.5
+    _sd=_sd if _sd>1e-9 else 1.0
+    for s in industries: ind_z_conc20[s].append((ind_conc20[s][_di]-_m)/_sd)
+# 组合: avgdif z + conc z (正交信号相加, 不双重计数)
+ind_avgdif_conc10={s:[] for s in industries}
+for _di in range(n):
+    for s in industries: ind_avgdif_conc10[s].append(ind_z[s][_di]+ind_z_conc10[s][_di])
+ind_avgdif_conc20={s:[] for s in industries}
+for _di in range(n):
+    for s in industries: ind_avgdif_conc20[s].append(ind_z[s][_di]+ind_z_conc20[s][_di])
+
 # === 机制诊断: 行业倾斜信号(avgdif横截面z) 与 各 consec 因子的横截面相关性 ===
 # 目的: 解释「为何 MA144斜率 与 行业倾斜 冲突」。若二者高度相关=对同一趋势信号的双重计数。
 def _pearson(a,b):
@@ -495,7 +604,7 @@ def _pearson(a,b):
     cov=sum((a[i]-ma)*(b[i]-mb) for i in range(n))
     va=sum((x-ma)**2 for x in a); vb=sum((x-mb)**2 for x in b)
     return cov/((va*vb)**0.5) if va>0 and vb>0 else 0.0
-_diag={'ind_z':[], 'slope':[], 'rev':[], 'consec':[], 'vol':[], 'amt':[], 'amtr':[], 'breadth':[], 'breadth_d':[], 'abn':[], 'conc':[], 'abn_conc':[]}
+_diag={'ind_z':[], 'slope':[], 'rev':[], 'consec':[], 'vol':[], 'amt':[], 'amtr':[], 'breadth':[], 'breadth_d':[], 'abn':[], 'conc':[], 'abn_conc':[], 'conc10':[], 'conc20':[], 'avgdif_conc10':[], 'avgdif_conc20':[]}
 for _di in range(1,n):
     if cand_by_dateidx[_di] is None: continue
     _pd=dates_valid[_di-1]; _sig=date_pos[_pd]
@@ -512,6 +621,10 @@ for _di in range(1,n):
         _diag['abn'].append(ind_z_abn[_cd['ind']][_sig])
         _diag['conc'].append(ind_z_conc[_cd['ind']][_sig])
         _diag['abn_conc'].append(ind_abn_conc[_cd['ind']][_sig])
+        _diag['conc10'].append(ind_z_conc10[_cd['ind']][_sig])
+        _diag['conc20'].append(ind_z_conc20[_cd['ind']][_sig])
+        _diag['avgdif_conc10'].append(ind_avgdif_conc10[_cd['ind']][_sig])
+        _diag['avgdif_conc20'].append(ind_avgdif_conc20[_cd['ind']][_sig])
 print("\n机制诊断: 行业倾斜信号(avgdif-z) × consec 因子 (候选池横截面 n=%d)"%len(_diag['ind_z']), flush=True)
 _N=len(_diag['ind_z'])
 for _k in ['slope','rev','consec','vol']:
@@ -525,7 +638,7 @@ for _k in ['slope','rev','consec','vol']:
     print(f"  {_k:<6} corr(z)={_r:+.3f} | 触发占比={_act:5.1f}% | 加分样本均值z={_mp:+.2f} | 减分样本均值z={_mn:+.2f}", flush=True)
 # V55/V56 正交性诊断: 新信号 × (slope同维冲突 / avgdif冗余)
 print("\nV55/V56 正交性诊断: 新信号 × (slope=同维冲突源 / avgdif=当前倾斜)", flush=True)
-for _k in ['amt','amtr','breadth','breadth_d','abn','conc','abn_conc']:
+for _k in ['amt','amtr','breadth','breadth_d','abn','conc','abn_conc','conc10','conc20','avgdif_conc10','avgdif_conc20']:
     _rs=_pearson(_diag[_k], _diag['slope'])
     _ra=_pearson(_diag[_k], _diag['ind_z'])
     print(f"  {_k:<10} corr(信号,slope)={_rs:+.3f} | corr(信号,avgdif)={_ra:+.3f}", flush=True)
@@ -538,6 +651,12 @@ def simulate(cfg, start_idx=0, end_idx=None):
     # 自设置全局倾斜/softmax权重, 使直接调用 simulate()(如 WALK 块) 不依赖残留的全局 TILT_W
     TILT_W=cfg.get('tilt',0.0); BETA_W=cfg.get('beta',0.0)
     mode=cfg['mode']; signal=cfg.get('signal'); tilt=cfg.get('tilt',0.0); beta=cfg.get('beta',0.0)
+    signal2=cfg.get('signal2'); tilt2=cfg.get('tilt2',0.0)
+    reson=cfg.get('reson',0); reson_k=cfg.get('reson_k',0.0)  # 行业共振过滤: 0=关闭, 60/90=周期
+    # V4 状态依赖参数(动态持有期/止损/止盈)
+    _v4_hold={'bull':cfg.get('hold_bull',3),'flat':cfg.get('hold_flat',3),'short':cfg.get('hold_short',3)}
+    _v4_stop={'bull':cfg.get('stop_bull',-0.15),'flat':cfg.get('stop_flat',-0.15),'short':cfg.get('stop_short',-0.15)}
+    _v4_profit={'bull':cfg.get('profit_bull',0.50),'flat':cfg.get('profit_flat',0.50),'short':cfg.get('profit_short',0.50)}
     use_consec=cfg.get('consec',False)
     use_rev=cfg.get('use_rev',use_consec); use_slope=cfg.get('use_slope',use_consec); use_consec_b=cfg.get('use_consec_b',use_consec)
     # consec 因子阈值(可在 cfg 覆盖, 默认=V53 值, 保证默认配置精确复现)
@@ -555,9 +674,17 @@ def simulate(cfg, start_idx=0, end_idx=None):
         current_date=dates_valid[date_idx]; yr=current_date[:4]
         prev_date=dates_valid[date_idx-1] if date_idx>=1 else None
         idx_state=v4_state.get(current_date,'flat')
+        if cfg.get('v6_state'):
+            idx_state=_v6_state.get(current_date,'short')
+        if cfg.get('v5_state'):
+            idx_state='bull' if _v5sig.get(current_date,0) else 'short'
         if idx_state=='flat' and prev_state=='short': idx_state='short'
         prev_state=idx_state
-        max_pos=50 if idx_state=='bull' else (5 if idx_state=='short' else 20)
+        max_pos=50 if idx_state=='bull' else (cfg.get('flat_pos',20) if idx_state=='flat' else 5)
+        # v5风险开关(只空不多): v5=0时极致缩仓, v5=1时V4正常工作
+        if cfg.get('v5_short_riskoff') and not _v5sig.get(current_date,1):
+            max_pos=cfg.get('v5_short_max',1)
+            idx_state='short'
         if yr not in yearly:
             nav=cash
             for c,p in portfolio.items():
@@ -598,13 +725,16 @@ def simulate(cfg, start_idx=0, end_idx=None):
             if c_i>pos['max_price']: pos['max_price']=c_i
             if c_i>pos['max_price']: pos['max_price']=c_i
             pnl_pct=(o_j-pos['entry_price'])/pos['entry_price']
-            if pos['hold_days']>=MIN_HOLD and pnl_pct<=STOP_LOSS:
+            _eff_hold=_v4_hold.get(idx_state,_v4_hold['flat'])
+            _eff_stop=_v4_stop.get(idx_state,_v4_stop['flat'])
+            _eff_profit=_v4_profit.get(idx_state,_v4_profit['flat'])
+            if pos['hold_days']>=_eff_hold and pnl_pct<=_eff_stop:
                 sells.append((code,pos,o_j,'止损')); continue
-            if pos['hold_days']>=MIN_HOLD and i>=1:
+            if pos['hold_days']>=_eff_hold and i>=1:
                 dp=IND[code]['dif'][i-1]; ep=IND[code]['dea'][i-1]
                 if not(math.isnan(dp) or math.isnan(ep)):
                     if dp>ep and dif_i<=dea_i: sells.append((code,pos,o_j,'死叉')); continue
-            if pnl_pct>PROFIT_THRESHOLD and not math.isnan(ma5_i) and c_i<ma5_i:
+            if pnl_pct>_eff_profit and not math.isnan(ma5_i) and c_i<ma5_i:
                 sells.append((code,pos,o_j,'动态止盈')); continue
         seen=set(); su=[]
         for s in sells:
@@ -630,9 +760,17 @@ def simulate(cfg, start_idx=0, end_idx=None):
             if cands:
                 sig_di=date_pos[prev_date]
                 sig_map=industry_signal_at(sig_di, signal) if mode!='none' and signal else {}
+                sig_map2=industry_signal_at(sig_di, signal2) if mode!='none' and signal2 else {}
+                # 成分股过滤
+                if cfg.get('zz1000_only',False) and ZZ1000_CODES:
+                    cands=[c for c in cands if c['code'] in ZZ1000_CODES]
+                if cfg.get('zz500_only',False) and ZZ500_CODES:
+                    cands=[c for c in cands if c['code'] in ZZ500_CODES]
                 # 组合分数: 量比必选 + 各项 consec 加分按flag开关 + 倾斜
                 def compose(cd):
                     mult=1.0+cd['vol_bonus']
+                    if reson and cd['ind'] is not None and cd['ind'] in RESON_MAP.get(reson,{}):
+                        mult+=reson_k*RESON_MAP[reson][cd['ind']][sig_di]
                     if use_rev:
                         if RT is not None:
                             d=cd['rev_raw']
@@ -657,8 +795,13 @@ def simulate(cfg, start_idx=0, end_idx=None):
                         else:
                             mult+=cd['consec_bonus']
                     sc=cd['base_score']*PENALTY.get(cd['gc'],0.2)*mult
-                    if mode=='tilt' and cd['ind'] is not None and signal:
-                        sc*=(1.0+TILT_W*clip(sig_map.get(cd['ind'],0.0),-2,2))
+                    if mode=='tilt' and cd['ind'] is not None:
+                        _zt=0.0
+                        if signal:
+                            _zt+=TILT_W*clip(sig_map.get(cd['ind'],0.0),-2,2)
+                        if signal2:
+                            _zt+=tilt2*clip(sig_map2.get(cd['ind'],0.0),-2,2)
+                        sc*=(1.0+_zt)
                     return sc
                 if mode=='slot':
                     # softmax 配额
@@ -793,6 +936,28 @@ elif EXP=='signalv3':
     for _sig in ['abn','conc','abn_conc']:
         for _k in _KS:
             CONFIGS.append({'name':f'倾斜-{_sig}-k{_k}','mode':'tilt','signal':_sig,'tilt':_k})
+elif EXP=='signalv4':
+    # V57: conc滚动版(conc10/20) + avgdif+conc组合 各扫 k 找峰值
+    CONFIGS=[]
+    for _sig in ['conc10','conc20','avgdif_conc10','avgdif_conc20']:
+        for _k in [0.15,0.20,0.26,0.30]:
+            CONFIGS.append({'name':f'倾斜-{_sig}-k{_k}','mode':'tilt','signal':_sig,'tilt':_k})
+elif EXP=='dual':
+    # V58: 双倾斜因子 avgdif(k1) + conc20(k2), 加法叠加
+    CONFIGS=[]
+    for _k1 in [0.20,0.26]:
+        for _k2 in [0.10,0.15,0.20]:
+            CONFIGS.append({'name':f'双-avgdif{_k1}-conc20{_k2}','mode':'tilt','signal':'avgdif','tilt':_k1,'signal2':'conc20','tilt2':_k2,'consec':False})
+    # 对照: 单因子
+    CONFIGS.append({'name':'单-avgdif-k0.26','mode':'tilt','signal':'avgdif','tilt':0.26,'consec':False})
+    CONFIGS.append({'name':'单-conc20-k0.15','mode':'tilt','signal':'conc20','tilt':0.15,'consec':False})
+elif EXP=='v60':
+    CONFIGS=[
+        {'name':'V4基线','mode':'none'},
+        {'name':'V4+consec','mode':'none','use_rev':True,'use_slope':True,'use_consec_b':True},
+        {'name':'V6基线(flat30)','mode':'none','v6_state':True,'flat_pos':30},
+        {'name':'V6+consec(flat30)','mode':'none','use_rev':True,'use_slope':True,'use_consec_b':True,'v6_state':True,'flat_pos':30},
+    ]
 else:
     # 默认: V53 消融(11配置)
     CONFIGS=[
@@ -822,6 +987,78 @@ elif EXP=='signalv2':
     print("  倾斜信号源 V55: 资金强度(amt=行业成交额z / amtr=成交额5日变化) + 赚钱效应(breadth=上涨占比 / breadth_d=Δ占比) — 均 OHLCV 派生, 与趋势同域; 重点看正交性诊断与 OOS。", flush=True)
 elif EXP=='signalv3':
     print("  倾斜信号源 V56: 异常换手(abn=成交额/自身MA20, 去规模偏) + 成交集中度(conc=HHI归一化, 资金聚焦龙头) + 组合(abn_conc) — 修复 V55 总量规模偏/无集中度缺陷; 重点看正交性诊断与 OOS。", flush=True)
+elif EXP=='signalv4':
+    print("  V57: conc滚动版(conc10/conc20=10/20日HHI均值, 抓阶段性热度) + avgdif+conc组合(正交信号相加) — 用L1行业, 看平滑版+组合能否超越纯avgdif。", flush=True)
+elif EXP=='dual':
+    print("  V58: 双倾斜因子 avgdif(k1) + conc20(k2) 加法叠加 — score*=1+k1*z_avgdif+k2*z_conc20; 扫 k1∈{0.20,0.26}, k2∈{0.10,0.15,0.20} + 单因子对照。", flush=True)
+elif EXP=='analysis':
+    print("  备选池 Top20 多期持有分析 — 每日按量比基线取top20, 计算3/5/10/20日 open-to-open 胜率与收益。", flush=True)
+    _rb=simulate({'mode':'none','consec':False,'name':'base'},0,n)
+    _nav=_rb['nav_arr']
+    import pandas as pd
+    _zz=pd.read_parquet('/workspace/data/zz1000_hfq.parquet')
+    _H=[3,5,10,20]; _maxH=max(_H)
+    _wr={h:[] for h in _H}; _ar={h:[] for h in _H}; _ir={h:[] for h in _H}
+    _dt=[]; _nav_on=[]
+    for _di in range(1,n-_maxH):
+        _cs=cand_by_dateidx[_di]
+        if not _cs: continue
+        _sc=[cd['base_score']*0.2*(1+cd['vol_bonus']) for cd in _cs]
+        _top=sorted(range(len(_cs)), key=lambda i:_sc[i], reverse=True)[:20]
+        _rd={h:[] for h in _H}
+        for _i in _top:
+            _cd=_cs[_i]; _ei=IND[_cd['code']]['date_to_idx'].get(dates_valid[_di])
+            for h in _H:
+                _xi=IND[_cd['code']]['date_to_idx'].get(dates_valid[_di+h])
+                if _ei is not None and _xi is not None and IND[_cd['code']]['opens'][_ei]>0 and IND[_cd['code']]['opens'][_xi]>0:
+                    _rd[h].append(IND[_cd['code']]['opens'][_xi]/IND[_cd['code']]['opens'][_ei]-1)
+        if all(len(_rd[h])>=10 for h in _H):
+            for h in _H:
+                _wr[h].append(sum(1 for r in _rd[h] if r>0)/len(_rd[h]))
+                _ar[h].append(sum(_rd[h])/len(_rd[h]))
+            _dt.append(dates_valid[_di])
+            _ni=_zz.index.get_loc(dates_valid[_di]) if dates_valid[_di] in _zz.index else -1
+            if _ni>=0 and _ni+_maxH<len(_zz):
+                _nav_on.append(_nav[_di])
+                for h in _H:
+                    _ir[h].append(_zz.iloc[_ni+h]['close']/_zz.iloc[_ni]['close']-1)
+    _N=len(_dt)
+    print(f"\n有效天数: {_N}")
+    print(f"\n{'持有期':>6} {'平均胜率':>8} {'中位胜率':>8} {'平均收益':>9} {'>50%':>6} {'>60%':>6} {'<40%':>6} {' corr指数':>8} {' corrNAV':>8}")
+    print("-"*80)
+    _wn=sum(_nav_on)/_N
+    for h in _H:
+        _wr_h=_wr[h]; _ar_h=_ar[h]; _ir_h=_ir[h]
+        _n=len(_wr_h); _wm=sum(_wr_h)/_n; _am=sum(_ar_h)/_n; _im=sum(_ir_h)/_n
+        _gt50=sum(1 for w in _wr_h if w>0.5)/_n*100
+        _gt60=sum(1 for w in _wr_h if w>0.6)/_n*100
+        _lt40=sum(1 for w in _wr_h if w<0.4)/_n*100
+        _ci=sum((_wr_h[i]-_wm)*(_ir_h[i]-_im) for i in range(_n))
+        _cn=sum((_wr_h[i]-_wm)*(_nav_on[i]-_wn) for i in range(_n))
+        _s1=(sum((x-_wm)**2 for x in _wr_h)/_n)**0.5
+        _s2=(sum((x-_im)**2 for x in _ir_h)/_n)**0.5
+        _s3=(sum((x-_wn)**2 for x in _nav_on)/_n)**0.5
+        _corr_i=f'{_ci/_n/_s1/_s2:.3f}' if _s1>0 and _s2>0 else 'NA'
+        _corr_n=f'{_cn/_n/_s1/_s3:.3f}' if _s1>0 and _s3>0 else 'NA'
+        _med=sorted(_wr_h)[_n//2]*100
+        print(f"{h:>4}日 {_wm*100:>7.1f}% {_med:>7.1f}% {_am*100:>8.2f}% {_gt50:>5.1f}% {_gt60:>5.1f}% {_lt40:>5.1f}% {_corr_i:>8} {_corr_n:>8}")
+    print()
+    for _s,_e,_lb in [(0,_N//3,'初期'),(_N//3,_N*2//3,'中期'),(_N*2//3,_N,'近期')]:
+        if _e-_s>0:
+            _ss=f"  {_lb}({_dt[_s][:7]}~{_dt[_e-1][:7]}):"
+            for h in _H: _ss+=f" {h}日{sum(_wr[h][_s:_e])/(_e-_s)*100:.1f}%"
+            print(_ss)
+    print(f"\n指数涨跌时 胜率>50% 占比:")
+    for h in _H:
+        _wr_h=_wr[h]; _ir_h=_ir[h]
+        _up=sum(1 for i in range(_N) if _ir_h[i]>0 and _wr_h[i]>0.5)
+        _up_t=sum(1 for i in range(_N) if _ir_h[i]>0)
+        _dn=sum(1 for i in range(_N) if _ir_h[i]<=0 and _wr_h[i]>0.5)
+        _dn_t=sum(1 for i in range(_N) if _ir_h[i]<=0)
+        print(f"  {h}日: 指数涨时{_up/_up_t*100:.0f}% / 指数跌时{_dn/_dn_t*100:.0f}% (n_up={_up_t}, n_dn={_dn_t})")
+    import sys; sys.exit(0)
+elif EXP=='v60':
+    print("  V60: V6状态机(50/30/5) vs V4(50/20/5) — 基线+consec对比", flush=True)
 t0=time.time()
 rows=[]
 DEBUG = os.environ.get('DEBUG','0')=='1'
@@ -958,6 +1195,32 @@ if os.environ.get('WALK','0')=='1':
         _col=f'OOS {_sig}'
         print("\n"+"="*104)
         print(f"V56 新行业信号 Walk-forward ({_sig} @k{_k} vs 基线 vs avgdif k0.26, 扩展窗口[0,s)/[s,e))")
+        print("="*104)
+        print(f"{'测试窗':<22}{'OOS基线':>9}{_col:>13}{'OOS k0.26':>12}{f'{_sig}胜基线':>15}")
+        print("-"*104)
+        _b=[]; _x=[]; _t=[]; _win=0
+        for (s,e) in test_windows:
+            rb=simulate({'mode':'none','consec':False,'name':'base'},0,e)
+            rx=simulate({'mode':'tilt','signal':_sig,'tilt':_k,'consec':False,'name':_sig},0,e)
+            r26=simulate({'mode':'tilt','signal':'avgdif','tilt':0.26,'consec':False,'name':'k0.26'},0,e)
+            _br,bm,bratio=win_metrics(rb['nav_arr'],s,e)
+            _xr,xm,xratio=win_metrics(rx['nav_arr'],s,e)
+            _rr,rm,r26ratio=win_metrics(r26['nav_arr'],s,e)
+            win=1 if xratio>bratio else 0
+            _win+=win
+            _b.append(bratio); _x.append(xratio); _t.append(r26ratio)
+            print(f"{(dates_valid[s]+'~'+dates_valid[e-1]).ljust(20)}",f"{bratio:>9.2f}",f"{xratio:>13.2f}",f"{r26ratio:>12.2f}",f"{'是' if win else '否':>15}")
+        _mb=sum(_b)/len(_b); _mx=sum(_x)/len(_x); _mt=sum(_t)/len(_t)
+        print("-"*104)
+        print(f"{'OOS均值':<22}{_mb:>9.2f}{_mx:>13.2f}{_mt:>12.2f}   {_sig}胜基线 {_win}/{len(test_windows)}")
+        print(f"      {_sig}@k{_k} OOS均值 {_mx:.2f} vs avgdif k0.26 OOS均值 {_mt:.2f} → 新信号 {'更优' if _mx>_mt else '更劣'}; 均 vs 基线 {_mb:.2f}")
+
+    # === V57 conc平滑版 walk-forward (conc20 vs 基线 & avgdif k0.26) ===
+    _v7_sigs=[('conc20',0.15),('conc10',0.26)]
+    for _sig,_k in _v7_sigs:
+        _col=f'OOS {_sig}'
+        print("\n"+"="*104)
+        print(f"V57 conc平滑版 Walk-forward ({_sig} @k{_k} vs 基线 vs avgdif k0.26, 扩展窗口[0,s)/[s,e))")
         print("="*104)
         print(f"{'测试窗':<22}{'OOS基线':>9}{_col:>13}{'OOS k0.26':>12}{f'{_sig}胜基线':>15}")
         print("-"*104)
